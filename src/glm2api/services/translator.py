@@ -472,6 +472,7 @@ def resolve_networking(model: str, web_search: object) -> bool:
 class GLMEventAccumulator:
     model: str
     allowed_tool_names: set[str] | None = None
+    required_params: dict[str, list[str]] | None = None
     fallback_tool_url: str | None = None
     debug_enabled: bool = False
     logger: Logger | None = None
@@ -498,6 +499,7 @@ class GLMEventAccumulator:
 
     def __post_init__(self) -> None:
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
+        self.tool_parser.required_params = self.required_params
 
     def consume_event(self, payload: dict[str, object]) -> tuple[list[str], str | None]:
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 解析事件", payload)
@@ -607,27 +609,13 @@ class GLMEventAccumulator:
         chunks: list[str] = []
         final_text = self._deferred_visible_text + tail_text
         self._deferred_visible_text = ""
-        if not final_text and not all_tool_calls and self.allowed_tool_names is not None:
-            _, attempted_tool_calls = parse_tool_calls_from_text(
-                self._cached_full_text.strip(),
-                allowed_tool_names=None,
-            )
-            unavailable_names = sorted(
-                {
-                    str(tool_call.get("function", {}).get("name", "")).strip()
-                    for tool_call in attempted_tool_calls
-                    if isinstance(tool_call.get("function"), dict)
-                    and str(tool_call.get("function", {}).get("name", "")).strip()
-                    not in self.allowed_tool_names
-                }
-            )
-            if unavailable_names:
-                allowed_names = ", ".join(sorted(self.allowed_tool_names)) or "(none)"
-                final_text = (
-                    "模型尝试调用未声明工具 "
-                    + ", ".join(f"`{name}`" for name in unavailable_names)
-                    + f"，已阻止。本轮只允许这些工具：{allowed_names}。"
-                )
+
+        # Never hand the client a turn with neither text nor a tool call: an
+        # agent loop reads that as "the model stopped" and stalls. Report the
+        # undeclared tool when the model named one, and a plain notice
+        # otherwise.
+        if not final_text and not all_tool_calls:
+            final_text = self._describe_unusable_turn()
         if final_text and not all_tool_calls:
             delta_payload: dict[str, object] = {"content": final_text}
             if not self.emitted_role:
@@ -730,6 +718,7 @@ class GLMEventAccumulator:
         clean_content, xml_tool_calls = parse_tool_calls_from_text(
             full_text.strip(),
             allowed_tool_names=self.allowed_tool_names,
+            required_params=self.required_params,
         )
         xml_tool_calls = sanitize_tool_calls(xml_tool_calls, fallback_url=self.fallback_tool_url)
         if not xml_tool_calls:
@@ -778,6 +767,35 @@ class GLMEventAccumulator:
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM 非流式最终响应", response)
         return response
 
+    def _describe_unusable_turn(self) -> str:
+        """Explain a turn that produced neither usable text nor a tool call."""
+        _, attempted_tool_calls = parse_tool_calls_from_text(
+            self._cached_full_text.strip(),
+            allowed_tool_names=None,
+        )
+        names = sorted(
+            {
+                str(tool_call.get("function", {}).get("name", "")).strip()
+                for tool_call in attempted_tool_calls
+                if isinstance(tool_call.get("function"), dict)
+                and str(tool_call.get("function", {}).get("name", "")).strip()
+            }
+        )
+        declared = self.allowed_tool_names
+        if not names:
+            return "模型本轮没有返回可用的文本或工具调用，请重试或换一种说法。"
+        if declared is None:
+            return "模型尝试调用 " + ", ".join(f"`{name}`" for name in names) + "，但本轮未声明任何工具。"
+        unavailable = [name for name in names if name not in declared]
+        if not unavailable:
+            return "模型调用 " + ", ".join(f"`{name}`" for name in names) + " 时没有提供参数，已阻止。请重试。"
+        allowed_names = ", ".join(sorted(declared)) or "(none)"
+        return (
+            "模型尝试调用未声明工具 "
+            + ", ".join(f"`{name}`" for name in unavailable)
+            + f"，已阻止。本轮只允许这些工具：{allowed_names}。"
+        )
+
     def _extract_reasoning_tool_calls(self, reasoning_text: str | None = None) -> list[dict[str, object]]:
         source = (reasoning_text if reasoning_text is not None else self.last_full_reasoning) or self._cached_full_reasoning
         if not source:
@@ -785,6 +803,7 @@ class GLMEventAccumulator:
         _, tool_calls = parse_tool_calls_from_text(
             source.strip(),
             allowed_tool_names=self.allowed_tool_names,
+            required_params=self.required_params,
         )
         return sanitize_tool_calls(tool_calls, fallback_url=self.fallback_tool_url)
 

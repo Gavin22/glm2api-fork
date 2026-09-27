@@ -196,6 +196,9 @@ def _append_value(mapping: dict[str, object], key: str, value: object) -> None:
 def _xml_value_to_object(element: ET.Element) -> object:
     children = [child for child in list(element) if isinstance(child.tag, str)]
     if not children:
+        # ``<parameter name="items"></parameter>`` is an empty list, not "".
+        if _is_empty_container(element):
+            return [] if _names_a_list(element) else ""
         return _coerce_leaf_value(_leaf_text(element))
 
     repeated_item_only = all(_local_name(child.tag) == "item" for child in children)
@@ -207,6 +210,23 @@ def _xml_value_to_object(element: ET.Element) -> object:
         key = child.attrib.get("name", "").strip() or _local_name(child.tag)
         _append_value(result, key, _xml_value_to_object(child))
     return result
+
+
+def _is_empty_container(element: ET.Element) -> bool:
+    """True for ``<x></x>`` / ``<x/>``: no children and no text at all.
+
+    Wholly-whitespace text is *not* empty — it is a real payload for
+    file-editing tools, which is why the raw text is checked rather than
+    ``strip()``-ed.
+    """
+    if list(element):
+        return False
+    return "".join(element.itertext()) == ""
+
+
+def _names_a_list(element: ET.Element) -> bool:
+    name = (element.attrib.get("name", "") or _local_name(element.tag)).strip().lower()
+    return name.endswith("s") or name in {"list", "array", "items"}
 
 
 def _extract_tool_name(element: ET.Element) -> str:
@@ -528,13 +548,16 @@ def _close_truncated_block(text: str) -> list[str]:
 def _recover_trailing_block(
     remainder: str,
     allowed_tool_names: set[str] | None,
+    required_params: dict[str, list[str]] | None = None,
 ) -> tuple[str, list[dict[str, object]]]:
     """Salvage a truncated tool block that would otherwise be discarded."""
     if not remainder or "<|" not in remainder:
         return "", []
     for completion in _close_truncated_block(remainder):
         candidate = remainder.rstrip() + completion
-        spans, tool_calls = _extract_tool_blocks(candidate, allowed_tool_names, allow_trailing_close=True)
+        spans, tool_calls = _extract_tool_blocks(
+            candidate, allowed_tool_names, allow_trailing_close=True, required_params=required_params
+        )
         if tool_calls:
             leftover = _remove_spans(candidate, spans, trim_outer_whitespace=True)
             return leftover, tool_calls
@@ -579,6 +602,7 @@ def _split_stream_text(
     text: str,
     allowed_tool_names: set[str] | None,
     final: bool,
+    required_params: dict[str, list[str]] | None = None,
 ) -> tuple[str, str, list[dict[str, object]]]:
     hold_from_candidates = [
         index
@@ -600,15 +624,23 @@ def _split_stream_text(
 
     processable = text[:safe_end]
     remainder = text[safe_end:]
-    spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names, allow_trailing_close=final)
+    spans, tool_calls = _extract_tool_blocks(
+        processable, allowed_tool_names, allow_trailing_close=final, required_params=required_params
+    )
     visible = _remove_spans(processable, spans, trim_outer_whitespace=final)
     return visible, remainder, tool_calls
 
 
-def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = None) -> tuple[str, list[dict[str, object]]]:
+def parse_tool_calls_from_text(
+    text: str,
+    allowed_tool_names: set[str] | None = None,
+    required_params: dict[str, list[str]] | None = None,
+) -> tuple[str, list[dict[str, object]]]:
     if not text:
         return "", []
-    spans, tool_calls = _extract_tool_blocks(text, allowed_tool_names, allow_trailing_close=True)
+    spans, tool_calls = _extract_tool_blocks(
+        text, allowed_tool_names, allow_trailing_close=True, required_params=required_params
+    )
     return _remove_spans(text, spans), tool_calls
 
 
@@ -617,6 +649,7 @@ class StreamingToolParser:
     pending_text: str = ""
     tool_calls: list[dict[str, object]] = field(default_factory=list)
     allowed_tool_names: set[str] | None = None
+    required_params: dict[str, list[str]] | None = None
 
     def consume(self, chunk: str) -> str:
         if not chunk:
@@ -626,6 +659,7 @@ class StreamingToolParser:
             self.pending_text,
             allowed_tool_names=self.allowed_tool_names,
             final=False,
+            required_params=self.required_params,
         )
         self.pending_text = remainder
         self.tool_calls.extend(parsed_calls)
@@ -636,6 +670,7 @@ class StreamingToolParser:
             self.pending_text,
             allowed_tool_names=self.allowed_tool_names,
             final=True,
+            required_params=self.required_params,
         )
         self.pending_text = ""
         self.tool_calls.extend(parsed_calls)
@@ -644,7 +679,9 @@ class StreamingToolParser:
         # the client never receives a turn that is both text-free and
         # tool-free (which stalls an agent loop).
         if not parsed_calls and remainder:
-            recovered_text, recovered_calls = _recover_trailing_block(remainder, self.allowed_tool_names)
+            recovered_text, recovered_calls = _recover_trailing_block(
+                remainder, self.allowed_tool_names, self.required_params
+            )
             if recovered_calls:
                 self.tool_calls.extend(recovered_calls)
                 return (visible + recovered_text).strip(), self.tool_calls

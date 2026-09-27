@@ -336,6 +336,88 @@ def test_accumulator_reports_unavailable_dsml_tool_instead_of_empty_response():
     assert '"finish_reason":"stop"' in final_chunks[1]
 
 
+def test_finalize_never_emits_a_text_and_tool_free_turn():
+    """An empty turn reads as "the model stopped" and stalls an agent loop."""
+    accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"shell"})
+    chunks, status = accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "status": "finish",
+            "parts": [{"logic_id": "1", "content": [{"type": "text", "text": "   "}]}],
+        }
+    )
+
+    final_chunks = accumulator.finalize(status)
+
+    assert chunks == []
+    body = "".join(final_chunks)
+    assert '"finish_reason":"stop"' in body
+    assert '"content":""' not in body
+
+
+def test_finalize_reports_undeclared_tool_while_streaming():
+    """Claude Code streams, so the notice must not be gated on non-streaming."""
+    accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"shell"})
+    accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": '<|DSML|tool_calls><|DSML|invoke name="ghost_tool">'
+                            '<|DSML|parameter name="a">1</|DSML|parameter>'
+                            "</|DSML|invoke></|DSML|tool_calls>",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    final_chunks = accumulator.finalize("finish")
+
+    body = "".join(final_chunks)
+    assert "未声明工具" in body
+    assert "`ghost_tool`" in body
+
+
+def test_finalize_reports_tool_call_that_arrived_without_arguments():
+    """DSML wrapping a JSON body parses to {} — running Bash with no command
+    errors, and the error feeds back into a spinning loop."""
+    accumulator = GLMEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"shell"},
+        required_params={"shell": ["command"]},
+    )
+    accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<|DSML|tool_calls><|DSML|invoke name=\"shell\"></|DSML|invoke></|DSML|tool_calls>",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    final_chunks = accumulator.finalize("finish")
+
+    body = "".join(final_chunks)
+    assert "tool_calls" not in body or "没有提供参数" in body
+    assert body.strip()
+
+
 def test_convert_messages_respects_tool_choice_none_and_specific():
     none_converted = convert_messages(
         messages=[{"role": "user", "content": "直接回答"}],

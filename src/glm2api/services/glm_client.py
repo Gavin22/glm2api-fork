@@ -129,6 +129,28 @@ class GLMWebClient:
             max_concurrency=config.glm_max_concurrency,
         )
 
+    @staticmethod
+    def _required_params(filtered_tools: list[dict[str, object]] | None) -> dict[str, list[str]]:
+        """Map tool name -> its schema's required fields.
+
+        Used to reject a parsed call that declares required parameters but
+        carries none, which would otherwise reach the client as a tool_use with
+        empty input and spin the agent loop.
+        """
+        required: dict[str, list[str]] = {}
+        for tool in filtered_tools or []:
+            function = tool.get("function", {})
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name", "")).strip()
+            schema = function.get("parameters", {})
+            if not name or not isinstance(schema, dict):
+                continue
+            fields = schema.get("required", [])
+            if isinstance(fields, list):
+                required[name] = [str(field) for field in fields]
+        return required
+
     def _resolve_tools(self, openai_payload: dict[str, object]) -> tuple[list[dict[str, object]] | None, set[str] | None]:
         raw_tools = list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None # type: ignore
         blocked_tool_names = {
@@ -159,6 +181,7 @@ class GLMWebClient:
         accumulator = GLMEventAccumulator(
             model=str(payload["model"]),
             allowed_tool_names=allowed_tool_names,
+            required_params=self._required_params(self._resolve_tools(payload)[0]),
             fallback_tool_url=extract_recent_user_url(list(payload.get("messages", []))), # type: ignore[arg-type]
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
@@ -218,6 +241,7 @@ class GLMWebClient:
         accumulator = GLMEventAccumulator(
             model=str(payload["model"]),
             allowed_tool_names=allowed_tool_names,
+            required_params=self._required_params(self._resolve_tools(payload)[0]),
             fallback_tool_url=extract_recent_user_url(list(payload.get("messages", []))), # type: ignore[arg-type]
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,

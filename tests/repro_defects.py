@@ -27,6 +27,30 @@ def roundtrip(name: str, args: dict) -> dict:
     return json.loads(calls[0]["function"]["arguments"])
 
 
+def roundtrip_via_translator(name: str, args: dict) -> dict:
+    """Snapshot/restore through the translator, which is what upstream sees."""
+    from glm2api.services.translator import convert_messages
+
+    block = serialize_tool_call_block(name, json.dumps(args, ensure_ascii=False))
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": f"call_{name}", "type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": f"call_{name}", "name": name, "content": block},
+    ]
+    prompt = convert_messages(messages, tools=None)[0]["content"][0]["text"]
+    # The assistant turn is re-serialized into DSML; parse it back out.
+    _, calls = parse_tool_calls_from_text(prompt, allowed_tool_names=None)
+    if not calls:
+        return {"__lost__": True}
+    return json.loads(calls[0]["function"]["arguments"])
+
+
 def check(label: str, ok: bool) -> None:
     print(f"[{'PASS' if ok else 'FAIL'}] {label}")
 
