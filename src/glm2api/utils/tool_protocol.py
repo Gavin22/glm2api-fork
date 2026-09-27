@@ -80,7 +80,12 @@ def _dsml_parameters_from_object(payload: object) -> str:
         parts: list[str] = []
         for key, value in payload.items():
             name = _xml_escape_text(_safe_parameter_name(key))
-            parts.append(f'<|DSML|parameter name="{name}">{_dsml_parameters_from_object(value)}</|DSML|parameter>')
+            # An empty container is ambiguous between "" and {} on the way
+            # back in, so tag the intended shape explicitly.
+            marker = ' type="obj"' if value == {} else ""
+            parts.append(
+                f'<|DSML|parameter name="{name}"{marker}>{_dsml_parameters_from_object(value)}</|DSML|parameter>'
+            )
         return "".join(parts)
     if isinstance(payload, list):
         return "".join(f"<item>{_dsml_parameters_from_object(item)}</item>" for item in payload)

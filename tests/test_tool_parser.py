@@ -273,8 +273,10 @@ def test_streaming_tool_parser_never_leaks_ml_markup_fragments():
 
 
 def test_parse_rejects_legacy_or_noncanonical_tool_markup():
+    # `<tool_call>{...}</tool_call>` is no longer rejected: models drift into
+    # that shape often enough that it is recovered as a real call. The
+    # remaining variants stay unsupported.
     legacy_variants = [
-        '<tool_call>{"tool":"Bash","params":{"command":"pwd"}}</tool_call>',
         "<function_call>Bash</function_call>",
         '<invoke name="Bash"><parameters><command>pwd</command></parameters></invoke>',
         '<tool_use><function name="Bash"><parameter name="command">pwd</parameter></function></tool_use>',
@@ -284,6 +286,29 @@ def test_parse_rejects_legacy_or_noncanonical_tool_markup():
         clean, tool_calls = parse_tool_calls_from_text(markup, {"Bash"})
         assert clean == markup
         assert tool_calls == []
+
+
+def test_parse_recovers_tool_call_written_as_json():
+    """Prompt-emulated protocols drift; a JSON call must not be shown as prose."""
+    variants = [
+        ('<tool_call>{"tool":"Bash","params":{"command":"pwd"}}</tool_call>', "Bash"),
+        ('```json\n{"name":"Bash","arguments":{"command":"pwd"}}\n```', "Bash"),
+        ('Bash({"command":"pwd"})', "Bash"),
+    ]
+
+    for markup, expected in variants:
+        clean, tool_calls = parse_tool_calls_from_text(markup, {"Bash"})
+        assert clean == ""
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["function"]["name"] == expected
+        assert tool_calls[0]["function"]["arguments"] == '{"command":"pwd"}'
+
+
+def test_parse_ignores_json_call_for_undeclared_tool():
+    clean, tool_calls = parse_tool_calls_from_text('Bash({"command":"pwd"})', {"Read"})
+
+    assert clean == 'Bash({"command":"pwd"})'
+    assert tool_calls == []
 
 
 def test_parse_rejects_tool_call_missing_parameters():

@@ -196,6 +196,10 @@ def _append_value(mapping: dict[str, object], key: str, value: object) -> None:
 def _xml_value_to_object(element: ET.Element) -> object:
     children = [child for child in list(element) if isinstance(child.tag, str)]
     if not children:
+        # ``type="obj"`` is emitted by the serializer for an empty object,
+        # which is otherwise indistinguishable from an empty string.
+        if element.attrib.get("type") == "obj":
+            return {}
         # ``<parameter name="items"></parameter>`` is an empty list, not "".
         if _is_empty_container(element):
             return [] if _names_a_list(element) else ""
@@ -220,6 +224,8 @@ def _is_empty_container(element: ET.Element) -> bool:
     ``strip()``-ed.
     """
     if list(element):
+        return False
+    if element.attrib.get("type") == "obj":
         return False
     return "".join(element.itertext()) == ""
 
@@ -251,6 +257,19 @@ def _extract_arguments(element: ET.Element) -> dict[str, object] | None:
             key = child.attrib.get("name", "").strip()
             if key:
                 _append_value(parameters, key, _xml_value_to_object(child))
+        if parameter_children:
+            return parameters
+        # Models sometimes wrap a JSON object body in the invoke instead of
+        # emitting parameter tags. Treating that as "no arguments" produced a
+        # tool_use with empty input, so read the body instead.
+        body = (element.text or "").strip()
+        if body.startswith("{"):
+            try:
+                parsed_body = json.loads(body)
+            except json.JSONDecodeError:
+                return parameters
+            if isinstance(parsed_body, dict):
+                return parsed_body
         return parameters
 
     for tag_name in ("ml_parameters", "parameters"):
@@ -641,6 +660,14 @@ def parse_tool_calls_from_text(
     spans, tool_calls = _extract_tool_blocks(
         text, allowed_tool_names, allow_trailing_close=True, required_params=required_params
     )
+    if tool_calls:
+        return _remove_spans(text, spans), tool_calls
+
+    # No DSML call. Fall back to JSON drift, and either way keep protocol
+    # markup out of the text the client shows the user.
+    json_spans, json_calls = _extract_json_tool_calls(text, allowed_tool_names, required_params)
+    if json_calls:
+        return _remove_spans(text, json_spans), json_calls
     return _remove_spans(text, spans), tool_calls
 
 
@@ -685,6 +712,123 @@ class StreamingToolParser:
             if recovered_calls:
                 self.tool_calls.extend(recovered_calls)
                 return (visible + recovered_text).strip(), self.tool_calls
+            drifted_calls = parse_json_tool_calls_from_text(
+                remainder, self.allowed_tool_names, self.required_params
+            )
+            if drifted_calls:
+                self.tool_calls.extend(drifted_calls)
+                return visible.strip(), self.tool_calls
 
         tail = "" if _looks_like_tool_markup_fragment(remainder) else remainder
         return (visible + tail).strip(), self.tool_calls
+
+
+JSON_NAME_KEYS = ("name", "tool", "tool_name", "toolName")
+JSON_ARGUMENT_KEYS = ("arguments", "params", "parameters", "input", "args")
+JSON_CALL_PATTERNS = (
+    re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE),
+    re.compile(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>", re.IGNORECASE),
+    re.compile(r"(?:^|[^A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(\{[\s\S]*?\})\s*\)"),
+)
+
+
+def _json_tool_call_from_object(
+    payload: object,
+    allowed_tool_names: set[str] | None,
+    index: int,
+) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+
+    name = ""
+    arguments: object = None
+    function = payload.get("function")
+    if isinstance(function, dict):
+        name = str(function.get("name", "")).strip()
+        arguments = function.get("arguments", function.get("parameters"))
+
+    if not name:
+        for key in JSON_NAME_KEYS:
+            candidate = payload.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                name = candidate.strip()
+                break
+    if not name or not _is_allowed_tool_name(name, allowed_tool_names):
+        return None
+
+    if arguments is None:
+        for key in JSON_ARGUMENT_KEYS:
+            if key in payload:
+                arguments = payload[key]
+                break
+    if arguments is None:
+        arguments = {}
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {"raw": arguments}
+    if not isinstance(arguments, dict):
+        arguments = {"value": arguments}
+    return _build_tool_call(name, arguments, index)
+
+
+def _extract_json_tool_calls(
+    text: str,
+    allowed_tool_names: set[str] | None = None,
+    required_params: dict[str, list[str]] | None = None,
+) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
+    """Recover tool calls the model wrote as JSON instead of DSML.
+
+    Hand-prompted XML protocols drift: models emit fenced JSON, a
+    ``<tool_call>`` wrapper, or a bare ``Name({...})`` call instead. Without
+    this the drift arrives at the client as ordinary assistant prose. The
+    matched spans are returned too, so the recovered call is not also emitted
+    as text.
+    """
+    if not text or "{" not in text:
+        return [], []
+
+    spans: list[tuple[int, int]] = []
+    tool_calls: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for pattern in JSON_CALL_PATTERNS:
+        for match in pattern.finditer(text):
+            inline_name = match.group(1) if pattern.groups == 2 else ""
+            raw_json = match.group(2) if pattern.groups == 2 else match.group(1)
+            try:
+                payload = json.loads(raw_json)
+            except json.JSONDecodeError:
+                continue
+            if inline_name:
+                # ``Name({...})`` — the object is the argument list, not a
+                # wrapper that carries its own name/arguments pair.
+                body = payload if isinstance(payload, dict) else {}
+                looks_like_call = any(key in body for key in JSON_ARGUMENT_KEYS) and any(
+                    key in body for key in JSON_NAME_KEYS
+                )
+                payload = body if looks_like_call else {"name": inline_name, "arguments": body}
+            tool_call = _json_tool_call_from_object(payload, allowed_tool_names, len(tool_calls))
+            if tool_call is None or _is_empty_args_call(tool_call, required_params):
+                continue
+            key = (
+                str(tool_call["function"]["name"]),
+                str(tool_call["function"]["arguments"]),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            tool_calls.append(tool_call)
+            spans.append(match.span())
+
+    for offset, tool_call in enumerate(tool_calls):
+        tool_call["index"] = offset
+    return spans, tool_calls
+
+
+def parse_json_tool_calls_from_text(
+    text: str,
+    allowed_tool_names: set[str] | None = None,
+    required_params: dict[str, list[str]] | None = None,
+) -> list[dict[str, object]]:
+    return _extract_json_tool_calls(text, allowed_tool_names, required_params)[1]

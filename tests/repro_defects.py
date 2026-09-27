@@ -135,7 +135,17 @@ print("6. Undeclared tool name (silent empty assistant message)")
 print("=" * 78)
 ghost = '<|DSML|tool_calls>\n  <|DSML|invoke name="ghost_tool">\n    <|DSML|parameter name="a">1</|DSML|parameter>\n  </|DSML|invoke>\n</|DSML|tool_calls>'
 clean, calls = parse_tool_calls_from_text(ghost, allowed_tool_names=ALLOWED)
-check("undeclared name is reported, not silently swallowed", bool(clean) or bool(calls))
+check("parser leaks no raw markup for an undeclared name", "<|DSML|" not in clean and "</|DSML|" not in clean)
+check("parser does not fabricate a call for an undeclared name", len(calls) == 0)
+
+# The notice itself is the translator's job (see
+# test_finalize_reports_undeclared_tool_while_streaming).
+from glm2api.services.translator import GLMEventAccumulator  # noqa: E402
+
+acc = GLMEventAccumulator(model="glm-test", allowed_tool_names=ALLOWED)
+acc.consume_event({"conversation_id": "c", "status": "finish", "parts": [{"logic_id": "1", "content": [{"type": "text", "text": ghost}]}]})
+body = "".join(acc.finalize("finish"))
+check("translator reports the undeclared tool instead of an empty turn", "ghost_tool" in body)
 print(f"        clean={clean!r} calls={len(calls)}")
 
 print()
