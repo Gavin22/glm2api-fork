@@ -396,6 +396,10 @@ def run_loop(base_url: str, api_key: str, model: str, turns: int, verbose: bool)
 # Self-check against the fake upstream
 # --------------------------------------------------------------------------
 
+# The fake model writes here. A literal path keeps a self-check run from
+# littering the repo root the way a bare "%s/" template once did.
+MOCK_ROOT = os.path.join(tempfile.gettempdir(), "glm_probe_mock")
+
 
 class MockUpstream(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
@@ -422,7 +426,7 @@ class MockUpstream(BaseHTTPRequestHandler):
         self.end_headers()
         script = (
             "<|DSML|tool_calls><|DSML|invoke name=\"Write\">"
-            "<|DSML|parameter name=\"file_path\">%s/greeting.py</|DSML|parameter>"
+            f"<|DSML|parameter name=\"file_path\">{MOCK_ROOT}/greeting.py</|DSML|parameter>"
             "<|DSML|parameter name=\"content\">def greet(name):\n    return 'Hello, ' + name\n</|DSML|parameter>"
             "</|DSML|invoke></|DSML|tool_calls>"
         )
