@@ -131,8 +131,59 @@ def _repair_malformed_dsml(block: str) -> str:
     return repaired
 
 
+PARAMETER_OPEN_PATTERN = re.compile(r"<\|DSML\|parameter\b[^>]*>", re.IGNORECASE)
+PARAMETER_CLOSE_PATTERN = re.compile(r"</\|DSML\|parameter\s*>", re.IGNORECASE)
+STRUCTURAL_TAG_PATTERN = re.compile(
+    r"</?\|DSML\|(?:tool_calls|invoke)\b[^>]*>", re.IGNORECASE
+)
+
+
+def _escape_protocol_tags_inside_values(block: str) -> str:
+    """Escape structural tags a model wrote inside a parameter value.
+
+    A Write call whose file content itself contains ``</|DSML|tool_calls>``
+    would otherwise be normalized into a real close tag and break the
+    surrounding XML, losing the whole call.
+    """
+    pieces: list[str] = []
+    cursor = 0
+    while True:
+        open_match = PARAMETER_OPEN_PATTERN.search(block, cursor)
+        if open_match is None:
+            pieces.append(block[cursor:])
+            break
+        pieces.append(block[cursor : open_match.end()])
+        depth = 1
+        scan = open_match.end()
+        body_start = scan
+        while depth:
+            next_open = PARAMETER_OPEN_PATTERN.search(block, scan)
+            next_close = PARAMETER_CLOSE_PATTERN.search(block, scan)
+            if next_close is None:
+                break
+            if next_open is not None and next_open.start() < next_close.start():
+                depth += 1
+                scan = next_open.end()
+                continue
+            depth -= 1
+            if depth == 0:
+                body = block[body_start : next_close.start()]
+                pieces.append(STRUCTURAL_TAG_PATTERN.sub(lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), body))
+                pieces.append(next_close.group(0))
+                cursor = next_close.end()
+                break
+            scan = next_close.end()
+        else:
+            break
+        if depth:
+            pieces.append(block[body_start:])
+            break
+    return "".join(pieces)
+
+
 def _normalize_dsml_to_xml(block: str) -> str:
     repaired = _repair_malformed_dsml(block)
+    repaired = _escape_protocol_tags_inside_values(repaired)
     return DSML_TAG_PATTERN.sub(lambda match: match.group(0).replace("|DSML|", ""), repaired)
 
 
@@ -416,21 +467,46 @@ def _mask_code_fences(text: str) -> str:
     return "".join(masked)
 
 
-def _find_matching_block(
+def _candidate_block_spans(
     masked_text: str,
     start_match: re.Match[str],
     *,
     allow_trailing_close: bool = False,
-) -> tuple[int, int] | None:
+):
+    """Yield each possible end of the block, earliest close tag first.
+
+    A close tag sitting inside a parameter value must not end the block, but
+    deciding which candidate is real needs a parse attempt, which the caller
+    does. The caller takes the first candidate that yields a tool call, so a
+    Write whose file content contains this proxy's own protocol text is no
+    longer truncated into a lost call plus leaked markup.
+    """
     tag_name = start_match.group("tag").lower()
-    if tag_name == "|dsml|tool_calls":
-        closing_pattern = DSML_TOOL_CALLS_TRAILING_CLOSE_PATTERN if allow_trailing_close else DSML_TOOL_CALLS_CLOSE_PATTERN
-    else:
+    if tag_name != "|dsml|tool_calls":
         closing_pattern = re.compile(rf"</{re.escape(tag_name)}\s*>", re.IGNORECASE)
-    closing_match = closing_pattern.search(masked_text, start_match.end())
-    if closing_match is None:
-        return None
-    return start_match.start(), closing_match.end()
+    else:
+        closing_pattern = (
+            DSML_TOOL_CALLS_TRAILING_CLOSE_PATTERN if allow_trailing_close else DSML_TOOL_CALLS_CLOSE_PATTERN
+        )
+
+    search_from = start_match.end()
+    while True:
+        closing_match = closing_pattern.search(masked_text, search_from)
+        if closing_match is None:
+            return
+        yield start_match.start(), closing_match.end()
+        search_from = closing_match.start() + 1
+
+
+DSML_OPEN_TAG_COUNTER = re.compile(r"<\|DSML\|(tool_calls|invoke|parameter)\b[^>]*>", re.IGNORECASE)
+DSML_CLOSE_TAG_COUNTER = re.compile(r"</\|DSML\|(tool_calls|invoke|parameter)\s*>", re.IGNORECASE)
+
+
+def _dsml_tags_balance(block: str) -> bool:
+    """True when every opened DSML tag in ``block`` is closed exactly once."""
+    opens = [name.lower() for name in DSML_OPEN_TAG_COUNTER.findall(block)]
+    closes = [name.lower() for name in DSML_CLOSE_TAG_COUNTER.findall(block)]
+    return sorted(opens) == sorted(closes)
 
 
 def _is_empty_args_call(
@@ -477,26 +553,38 @@ def _extract_tool_blocks(
         match = START_TAG_PATTERN.search(masked_text, cursor)
         if match is None:
             break
-        span = _find_matching_block(masked_text, match, allow_trailing_close=allow_trailing_close)
+
+        span = None
+        parsed_span = None
+        block_calls: list[dict[str, object]] = []
+        first_span = None
+        for candidate in _candidate_block_spans(masked_text, match, allow_trailing_close=allow_trailing_close):
+            if first_span is None:
+                first_span = candidate
+            start, end = candidate
+            candidate_calls, candidate_span = _parse_xml_block(text[start:end], allowed_tool_names, start)
+            candidate_calls = [
+                call for call in candidate_calls if not _is_empty_args_call(call, required_params)
+            ]
+            if candidate_span is not None and candidate_calls:
+                span, parsed_span, block_calls = candidate, candidate_span, candidate_calls
+                break
+
         if span is None:
-            break
+            if first_span is None:
+                break
+            # No candidate parsed, but the block is structurally complete. Keep
+            # hiding it so protocol markup is never shown to the user.
+            spans.append(first_span)
+            cursor = first_span[1]
+            continue
 
         start, end = span
-        block_calls, parsed_span = _parse_xml_block(text[start:end], allowed_tool_names, start)
-        block_calls = [call for call in block_calls if not _is_empty_args_call(call, required_params)]
-        if parsed_span is not None and block_calls:
-            for offset, tool_call in enumerate(block_calls, start=len(tool_calls)):
-                tool_call["index"] = offset
-            spans.append(parsed_span)
-            tool_calls.extend(block_calls)
-            cursor = end
-            continue
-        if match.group("tag").lower() in {"|dsml|tool_calls", "tool_calls", "ml_tool_calls", "ml_tool_call"}:
-            spans.append((start, end))
-            cursor = end
-            continue
-
-        cursor = match.end()
+        for offset, tool_call in enumerate(block_calls, start=len(tool_calls)):
+            tool_call["index"] = offset
+        spans.append(parsed_span)  # type: ignore[arg-type]
+        tool_calls.extend(block_calls)
+        cursor = end
 
     return spans, tool_calls
 
@@ -537,13 +625,17 @@ def _find_unmatched_fence_start(text: str) -> int | None:
 
 
 def _find_incomplete_block_start(text: str, *, allow_trailing_close: bool = False) -> int | None:
+    """Start of the first block that has not been closed yet, if any."""
     masked_text = _mask_code_fences(text)
     cursor = 0
     while cursor < len(masked_text):
         match = START_TAG_PATTERN.search(masked_text, cursor)
         if match is None:
             break
-        span = _find_matching_block(masked_text, match, allow_trailing_close=allow_trailing_close)
+        span = next(
+            _candidate_block_spans(masked_text, match, allow_trailing_close=allow_trailing_close),
+            None,
+        )
         if span is None:
             return match.start()
         cursor = span[1]
@@ -797,6 +889,7 @@ class StreamingToolParser:
             if drifted_calls:
                 self.tool_calls.extend(drifted_calls)
                 return visible.strip(), self.tool_calls
+
 
         tail = "" if _looks_like_tool_markup_fragment(remainder) else remainder
         return (visible + tail).strip(), self.tool_calls

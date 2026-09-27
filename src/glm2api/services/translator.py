@@ -11,7 +11,11 @@ from logging import Logger
 from ..config import AppConfig
 from ..logging_utils import debug_dump
 from ..model_variants import model_requests_search, model_requests_thinking, split_model_features
-from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
+from ..utils.tool_parser import (
+    StreamingToolParser,
+    parse_json_tool_calls_from_text,
+    parse_tool_calls_from_text,
+)
 from ..utils.tool_protocol import (
     BLOCKED_NATIVE_TOOL_NAMES,
     CANONICAL_TOOL_CALL_EXAMPLE,
@@ -616,6 +620,19 @@ class GLMEventAccumulator:
         # otherwise.
         if not final_text and not all_tool_calls:
             final_text = self._describe_unusable_turn()
+        elif final_text and not all_tool_calls:
+            # The model may have drifted to JSON instead of DSML; recover the
+            # call rather than handing the client raw JSON as assistant prose.
+            drifted_calls = parse_json_tool_calls_from_text(
+                final_text.strip(),
+                allowed_tool_names=self.allowed_tool_names,
+                required_params=self.required_params,
+            )
+            if drifted_calls:
+                for tc in drifted_calls:
+                    tc["index"] = len(all_tool_calls)
+                    all_tool_calls.append(tc)
+                final_text = ""
         if final_text and not all_tool_calls:
             delta_payload: dict[str, object] = {"content": final_text}
             if not self.emitted_role:
