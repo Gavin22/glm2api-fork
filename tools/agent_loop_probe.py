@@ -230,9 +230,19 @@ def run_tool(name: str, args: dict, root: str) -> tuple[bool, str]:
             if isinstance(command, list):
                 command = " ".join(str(part) for part in command)
             result = subprocess.run(
-                command, shell=True, capture_output=True, text=True, timeout=30, cwd=root
+                command,
+                shell=True,
+                capture_output=True,
+                timeout=30,
+                cwd=root,
+                # A Windows shell in this VM emits GBK, and a command that
+                # touches a non-UTF-8 path makes text=True raise instead of
+                # returning. Decode leniently so the harness reports a tool
+                # result rather than dying mid-run.
+                encoding="utf-8",
+                errors="replace",
             )
-            return result.returncode == 0, (result.stdout + result.stderr)[:2000]
+            return result.returncode == 0, ((result.stdout or "") + (result.stderr or ""))[:2000]
         if name == "Grep":
             matches: list[str] = []
             for dirpath, _dirs, files in os.walk(root):
