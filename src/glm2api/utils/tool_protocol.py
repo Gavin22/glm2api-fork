@@ -22,7 +22,7 @@ CANONICAL_TOOL_CALL_EXAMPLE = "\n".join(
     [
         "<|DSML|tool_calls>",
         '  <|DSML|invoke name="TOOL_NAME">',
-        '    <|DSML|parameter name="actual_parameter_name"><![CDATA[value]]></|DSML|parameter>',
+        '    <|DSML|parameter name="actual_parameter_name" type="str">raw value, XML-escaped</|DSML|parameter>',
         "  </|DSML|invoke>",
         "</|DSML|tool_calls>",
     ]
@@ -64,7 +64,10 @@ def _xml_escape_text(value: str) -> str:
 
 def _xml_wrap_scalar(value: object) -> str:
     if isinstance(value, str):
-        return f"<![CDATA[{value.replace(']]>', ']]]]><![CDATA[>')}]]>"
+        # XML-escape rather than CDATA: escaping is lossless for arbitrary
+        # strings, while a CDATA payload containing this protocol's own tags
+        # silently truncates the enclosing block.
+        return _xml_escape_text(value)
     return safe_json_dumps(value)
 
 
@@ -103,10 +106,13 @@ def serialize_tool_call_block(name: str, arguments: object) -> str:
 
 
 def serialize_tool_result_block(tool_call_id: object, tool_name: str, content: str) -> str:
-    safe_content = content.replace("]]>", "]]]]><![CDATA[>")
+    # XML-escape the body: a tool result may be an entire source file, and one
+    # containing this protocol's own close tags would otherwise terminate the
+    # wrapper inside the model's context.
+    safe_content = _xml_escape_text(content)
     return (
         f'<|DSML|tool_result call_id="{_xml_escape_text(str(tool_call_id or "unknown"))}" '
-        f'name="{_xml_escape_text(tool_name)}"><content><![CDATA[{safe_content}]]></content></|DSML|tool_result>'
+        f'name="{_xml_escape_text(tool_name)}"><content>{safe_content}</content></|DSML|tool_result>'
     )
 
 
@@ -165,7 +171,8 @@ def build_tool_call_instructions(
                 "- Encode nested objects with nested <|DSML|parameter name=\"...\"> tags.",
                 "- Use repeated <item> tags to represent arrays.",
                 "- JSON literals are allowed as parameter values when the schema expects an object, array, number, boolean, or null.",
-                "- Prefer <![CDATA[...]]> for arbitrary strings.",
+                "- Parameter values are XML-escaped, not CDATA-wrapped. Escape `&` as `&amp;`, `<` as `&lt;`, and `>` as `&gt;`; never emit a literal `<![CDATA[` block.",
+                "- Preserve every newline, tab and trailing space inside string values exactly. They are written verbatim to disk by file-editing tools.",
             ]
         )
 

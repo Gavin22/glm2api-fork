@@ -95,6 +95,9 @@ def test_streaming_tool_parser_never_leaks_dsml_markup_fragments():
 
 
 def test_parse_tool_calls_from_glm_malformed_dsml_markup():
+    # The trailing "\n" between the CDATA close and the parameter close tag is
+    # part of the command string; whitespace is preserved verbatim now that
+    # file-edit payloads depend on it.
     text = (
         '<|dsml|tool_calls|><|dsml|invoke name="shell"|>'
         '<|dsml|parameter name="command"><![CDATA["powershell.exe", "-Command", '
@@ -110,7 +113,7 @@ def test_parse_tool_calls_from_glm_malformed_dsml_markup():
     assert tool_calls[0]["function"]["name"] == "shell"
     assert tool_calls[0]["function"]["arguments"] == (
         '{"command":"\\"powershell.exe\\", \\"-Command\\", '
-        '\\"Get-ChildItem -Force | Select-Object Name, Mode, Length\\"","workdir":"E:\\\\Projects\\\\2api\\\\glm2api"}'
+        '\\"Get-ChildItem -Force | Select-Object Name, Mode, Length\\"\\n","workdir":"E:\\\\Projects\\\\2api\\\\glm2api"}'
     )
 
 

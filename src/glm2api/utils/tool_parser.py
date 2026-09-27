@@ -142,18 +142,19 @@ def _is_allowed_tool_name(tool_name: str, allowed_tool_names: set[str] | None) -
     return allowed_tool_names is None or tool_name in allowed_tool_names
 
 
-def _balanced_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
-
-
 def _leaf_text(element: ET.Element) -> str:
-    return _balanced_text("".join(element.itertext()))
+    """Raw text of a leaf element.
+
+    Newlines, tabs and runs of spaces are load-bearing: they carry the exact
+    bytes of ``Write.content`` / ``Edit.old_string`` / ``Edit.new_string``.
+    Collapsing them here is what made every file edit fail to match on disk,
+    so this must return the text verbatim.
+    """
+    return "".join(element.itertext())
 
 
 def _coerce_leaf_value(text: str) -> object:
     stripped = text.strip()
-    if stripped == "":
-        return ""
     if stripped.startswith("{") or stripped.startswith("["):
         try:
             return json.loads(stripped)
@@ -163,7 +164,7 @@ def _coerce_leaf_value(text: str) -> object:
                     return json.loads(stripped + "]")
                 except json.JSONDecodeError:
                     pass
-            return stripped
+            return text
     if stripped in {"true", "false"}:
         return stripped == "true"
     if stripped == "null":
@@ -172,13 +173,13 @@ def _coerce_leaf_value(text: str) -> object:
         try:
             return int(stripped)
         except ValueError:
-            return stripped
+            return text
     if re.fullmatch(r"-?\d+\.\d+", stripped):
         try:
             return float(stripped)
         except ValueError:
-            return stripped
-    return stripped
+            return text
+    return text
 
 
 def _append_value(mapping: dict[str, object], key: str, value: object) -> None:
@@ -386,11 +387,40 @@ def _find_matching_block(
     return start_match.start(), closing_match.end()
 
 
+def _is_empty_args_call(
+    tool_call: dict[str, object],
+    required_params: dict[str, list[str]] | None,
+) -> bool:
+    """True when a call declares required parameters but carries none.
+
+    The model sometimes emits well-formed DSML whose body is a JSON object
+    instead of parameter tags, which parses to ``{}``. Delivering that to the
+    client means running e.g. ``Bash`` with no ``command``: the tool errors, the
+    error is fed back, and the loop spins. Rejecting it lets the caller report
+    the failure instead.
+    """
+    if not required_params:
+        return False
+    function = tool_call.get("function", {})
+    if not isinstance(function, dict):
+        return False
+    required = required_params.get(str(function.get("name", "")))
+    if not required:
+        return False
+    arguments = str(function.get("arguments", ""))
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return False
+    return parsed == {} or parsed is None
+
+
 def _extract_tool_blocks(
     text: str,
     allowed_tool_names: set[str] | None,
     *,
     allow_trailing_close: bool = False,
+    required_params: dict[str, list[str]] | None = None,
 ) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
     masked_text = _mask_code_fences(text)
     spans: list[tuple[int, int]] = []
@@ -407,6 +437,7 @@ def _extract_tool_blocks(
 
         start, end = span
         block_calls, parsed_span = _parse_xml_block(text[start:end], allowed_tool_names, start)
+        block_calls = [call for call in block_calls if not _is_empty_args_call(call, required_params)]
         if parsed_span is not None and block_calls:
             for offset, tool_call in enumerate(block_calls, start=len(tool_calls)):
                 tool_call["index"] = offset
@@ -471,6 +502,43 @@ def _find_incomplete_block_start(text: str, *, allow_trailing_close: bool = Fals
             return match.start()
         cursor = span[1]
     return None
+
+
+def _close_truncated_block(text: str) -> list[str]:
+    """Close-tag completions to try when a tool block was cut off mid-stream.
+
+    ``max_tokens`` routinely truncates the model mid-block. Each completion
+    supplies the close tags the block still owes, innermost first, so a partial
+    block becomes a usable tool call instead of a silent empty turn.
+    """
+    stripped = text.rstrip()
+    # Only the final (incomplete) block matters; anything before it already
+    # parsed or was reported.
+    start = max(stripped.rfind("<|DSML|tool_calls"), stripped.rfind("<|dsml|tool_calls"))
+    if start != -1:
+        stripped = stripped[start:]
+    openings = re.findall(r"<\|DSML\|(tool_calls|invoke|parameter)\b[^>]*>", stripped, re.IGNORECASE)
+    if not openings:
+        return []
+
+    closers = [f"</|DSML|{name}>" for name in reversed(openings)]
+    return ["".join(closers[offset:]) for offset in range(len(closers))]
+
+
+def _recover_trailing_block(
+    remainder: str,
+    allowed_tool_names: set[str] | None,
+) -> tuple[str, list[dict[str, object]]]:
+    """Salvage a truncated tool block that would otherwise be discarded."""
+    if not remainder or "<|" not in remainder:
+        return "", []
+    for completion in _close_truncated_block(remainder):
+        candidate = remainder.rstrip() + completion
+        spans, tool_calls = _extract_tool_blocks(candidate, allowed_tool_names, allow_trailing_close=True)
+        if tool_calls:
+            leftover = _remove_spans(candidate, spans, trim_outer_whitespace=True)
+            return leftover, tool_calls
+    return "", []
 
 
 def _find_partial_tag_start(text: str) -> int | None:
@@ -571,5 +639,15 @@ class StreamingToolParser:
         )
         self.pending_text = ""
         self.tool_calls.extend(parsed_calls)
+
+        # A block cut off at max_tokens is recovered rather than dropped, so
+        # the client never receives a turn that is both text-free and
+        # tool-free (which stalls an agent loop).
+        if not parsed_calls and remainder:
+            recovered_text, recovered_calls = _recover_trailing_block(remainder, self.allowed_tool_names)
+            if recovered_calls:
+                self.tool_calls.extend(recovered_calls)
+                return (visible + recovered_text).strip(), self.tool_calls
+
         tail = "" if _looks_like_tool_markup_fragment(remainder) else remainder
         return (visible + tail).strip(), self.tool_calls

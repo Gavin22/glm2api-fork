@@ -53,7 +53,7 @@ def test_convert_messages_injects_xml_tool_prompt_and_history():
     assert "# TOOL USE PROTOCOL" in prompt
     assert "Use the DSML format below exactly." in prompt
     assert "The server will parse this DSML block back into standard OpenAI tool_calls." in prompt
-    assert "<|DSML|parameter name=\"actual_parameter_name\"><![CDATA[value]]></|DSML|parameter>" in prompt
+    assert "<|DSML|parameter name=\"actual_parameter_name\" type=\"str\">raw value, XML-escaped</|DSML|parameter>" in prompt
     assert "Each argument must be a <|DSML|parameter name=\"...\"> child of the invoke." in prompt
     assert "Parameter names are case-sensitive and must exactly match the schema." in prompt
     assert "never change it to `filepath`, `file_path`, or `FilePath`." in prompt
@@ -488,7 +488,7 @@ def test_convert_messages_repairs_cherry_fetch_url_and_skips_invalid_tool_error_
     prompt = converted[0]["content"][0]["text"]
 
     assert (
-        "<|DSML|parameter name=\"url\"><![CDATA[https://opendata.baidu.com/api.php?query=1.1.1.1&co=&resource_id=6006&oe=utf8]]></|DSML|parameter>"
+        "<|DSML|parameter name=\"url\">https://opendata.baidu.com/api.php?query=1.1.1.1&amp;co=&amp;resource_id=6006&amp;oe=utf8</|DSML|parameter>"
         in prompt
     )
     assert "expected string, received undefined" not in prompt
