@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[oc]
+.venv
+log/
+.pytest_cache/
+tests/
+tools/
+*.bundle
+agent_probe_samples.json
