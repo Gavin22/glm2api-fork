@@ -681,3 +681,105 @@ def test_accumulator_keeps_markdown_block_separators_between_parts():
         "## 查询结果：IP 地址 `1.1.1.1` 的归属地信息\n\n"
         "| 字段 | 值 |\n|---|---|\n| 查询 IP | `1.1.1.1` |"
     )
+
+
+def _frame(text: str, logic_id: str = "1", status: str = "generating") -> dict:
+    return {
+        "conversation_id": "conv_1",
+        "status": status,
+        "parts": [{"logic_id": logic_id, "content": [{"type": "text", "text": text}]}],
+    }
+
+
+def _delta_payloads(chunks: list[str]) -> list[dict]:
+    import json as _json
+
+    payloads = []
+    for chunk in chunks:
+        if not chunk.startswith("data: "):
+            continue
+        body = chunk[len("data: "):].strip()
+        try:
+            payloads.append(_json.loads(body))
+        except _json.JSONDecodeError:
+            continue
+    return payloads
+
+
+def _visible_text(chunks: list[str]) -> str:
+    """Concatenate the assistant text deltas a client would render from chunks."""
+    out = []
+    for payload in _delta_payloads(chunks):
+        delta = payload.get("choices", [{}])[0].get("delta", {})
+        if delta.get("content"):
+            out.append(delta["content"])
+    return "".join(out)
+
+
+def _tool_names(chunks: list[str]) -> list[str]:
+    names = []
+    for payload in _delta_payloads(chunks):
+        for call in payload.get("choices", [{}])[0].get("delta", {}).get("tool_calls", []):
+            name = call.get("function", {}).get("name")
+            if name:
+                names.append(name)
+    return names
+
+
+def test_deltas_are_not_resliced_when_upstream_normalises_whitespace():
+    """Upstream streams deltas, then ends the turn with a normalised snapshot.
+
+    The end-of-turn snapshot has the same text with the newlines collapsed, so
+    it is not an extension of what was already sent. A position-based diff
+    slices it at the old offset and emits the tail as if it were new, which
+    corrupted the client's view of the turn.
+    """
+    accumulator = GLMEventAccumulator(model="glm-test")
+    raw = "def greet(name):\n    return 'Hello, ' + name\n"
+
+    streamed: list[str] = []
+    first = "def greet(name):"
+    second = "\n    return 'Hello, ' + name\n"
+    streamed += accumulator.consume_event(_frame(first))[0]
+    streamed += accumulator.consume_event(_frame(first + second))[0]
+
+    # Final frame: same text, normalised to a single line.
+    normalised = "def greet(name): return 'Hello, ' + name"
+    tail = accumulator.consume_event(_frame(normalised, status="finish"))[0]
+
+    assert _visible_text(streamed) == raw
+    assert _visible_text(streamed + tail) == raw, (
+        "the normalised end-of-turn snapshot must not be re-sliced into the stream"
+    )
+
+
+def test_deltas_extend_when_snapshots_then_switch_to_increments():
+    """Deltas first, then increments throughout the tool call, then a full text.
+
+    The parser holds back the tail while it looks for a tool block, so the
+    *visible* text can shrink even though the raw snapshot only grew. Diffing
+    the visible text therefore merges unrelated fragments; diffing the raw
+    snapshot does not.
+    """
+    accumulator = GLMEventAccumulator(model="glm-test", allowed_tool_names={"Write"})
+
+    call = (
+        '<|DSML|tool_calls><|DSML|invoke name="Write">'
+        '<|DSML|parameter name="file_path">/tmp/a.txt</|DSML|parameter>'
+        '<|DSML|parameter name="content">hi</|DSML|parameter>'
+        "</|DSML|invoke></|DSML|tool_calls>"
+    )
+    pieces = ["Writing it. ", call]
+
+    seen: str = ""
+    chunks: list[str] = []
+    for piece in pieces:
+        seen = seen + piece if not seen else seen + piece
+        chunks += accumulator.consume_event(_frame(seen))[0]
+    chunks += accumulator.consume_event(_frame(seen, status="finish"))[0]
+    final = accumulator.finalize("finish")
+
+    assert _tool_names(chunks + final) == ["Write"], (
+        "a call streamed incrementally after plain text must still parse"
+    )
+    assert _visible_text(chunks + final).strip() == ""

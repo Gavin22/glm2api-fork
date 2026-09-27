@@ -488,6 +488,8 @@ class GLMEventAccumulator:
     last_full_reasoning: str = ""
     _part_text_sent: dict[str, int] = field(default_factory=dict)
     _part_reasoning_sent: dict[str, int] = field(default_factory=dict)
+    _sent_raw_text: dict[str, str] = field(default_factory=dict)
+    _sent_raw_reasoning: dict[str, str] = field(default_factory=dict)
     _known_logic_ids_for_text: list[str] = field(default_factory=list)
     _known_logic_ids_for_reasoning: list[str] = field(default_factory=list)
     tool_parser: StreamingToolParser = field(default_factory=StreamingToolParser)
@@ -830,34 +832,79 @@ class GLMEventAccumulator:
         reasoning_delta_parts: list[str] = []
 
         for logic_id in self.ordered_logic_ids:
-            rendered_text = self._cached_part_texts.get(logic_id, "")
-            rendered_reasoning = self._cached_part_reasonings.get(logic_id, "")
+            raw_text = "".join(self._content_snapshot(logic_id)[0])
+            raw_reasoning = "".join(self._content_snapshot(logic_id)[1])
 
-            if rendered_text:
-                prev_len = self._part_text_sent.get(logic_id, 0)
-                is_new = logic_id not in self._known_logic_ids_for_text
-                if is_new:
-                    self._known_logic_ids_for_text.append(logic_id)
-                    if text_delta_parts or self._part_text_sent:
-                        text_delta_parts.append("\n\n")
-                    text_delta_parts.append(rendered_text)
-                elif len(rendered_text) > prev_len:
-                    text_delta_parts.append(rendered_text[prev_len:])
-                self._part_text_sent[logic_id] = len(rendered_text)
+            if raw_text:
+                emitted = self._sent_raw_text.get(logic_id, "")
+                if raw_text.startswith(emitted):
+                    new_text = raw_text[len(emitted):]
+                else:
+                    # Upstream streamed this text as deltas and then sent a
+                    # different rendering of it (whitespace collapsed, a
+                    # fence added). Nothing is missing from the client, so
+                    # emit nothing rather than a correction or a duplicate.
+                    new_text = ""
+                if new_text:
+                    if logic_id not in self._known_logic_ids_for_text:
+                        self._known_logic_ids_for_text.append(logic_id)
+                        if text_delta_parts or self._part_text_sent:
+                            text_delta_parts.append("\n\n")
+                    text_delta_parts.append(new_text)
+                    self._sent_raw_text[logic_id] = raw_text
+                self._part_text_sent[logic_id] = len(self._cached_part_texts.get(logic_id, ""))
 
-            if rendered_reasoning:
-                prev_len = self._part_reasoning_sent.get(logic_id, 0)
-                is_new = logic_id not in self._known_logic_ids_for_reasoning
-                if is_new:
-                    self._known_logic_ids_for_reasoning.append(logic_id)
-                    if reasoning_delta_parts or self._part_reasoning_sent:
-                        reasoning_delta_parts.append("\n\n")
-                    reasoning_delta_parts.append(rendered_reasoning)
-                elif len(rendered_reasoning) > prev_len:
-                    reasoning_delta_parts.append(rendered_reasoning[prev_len:])
-                self._part_reasoning_sent[logic_id] = len(rendered_reasoning)
+            if raw_reasoning:
+                emitted = self._sent_raw_reasoning.get(logic_id, "")
+                if raw_reasoning.startswith(emitted):
+                    new_reasoning = raw_reasoning[len(emitted):]
+                else:
+                    new_reasoning = ""
+                if new_reasoning:
+                    if logic_id not in self._known_logic_ids_for_reasoning:
+                        self._known_logic_ids_for_reasoning.append(logic_id)
+                        if reasoning_delta_parts or self._part_reasoning_sent:
+                            reasoning_delta_parts.append("\n\n")
+                    reasoning_delta_parts.append(new_reasoning)
+                    self._sent_raw_reasoning[logic_id] = raw_reasoning
+                self._part_reasoning_sent[logic_id] = len(self._cached_part_reasonings.get(logic_id, ""))
 
         return "".join(text_delta_parts), "".join(reasoning_delta_parts)
+
+    def _content_snapshot(self, logic_id: str) -> tuple[list[str], list[str]]:
+        """Raw (text, reasoning) content strings for one part, in upstream order.
+
+        No joining or stripping: the caller only needs the concatenation to grow,
+        and normalising here would hide a truncated frame.
+        """
+        part = self.parts_by_logic_id.get(logic_id)
+        if not isinstance(part, dict):
+            return [], []
+        content_items = part.get("content", [])
+        if not isinstance(content_items, list):
+            return [], []
+
+        part_text: list[str] = []
+        part_reasoning: list[str] = []
+        for content in content_items:
+            if not isinstance(content, dict):
+                continue
+            item_type = content.get("type")
+            if item_type == "text":
+                part_text.append(str(content.get("text", "")))
+            elif item_type == "think":
+                part_reasoning.append(str(content.get("think", "")))
+            elif item_type == "code":
+                part_text.append(f"```python\n{content.get('code', '')}\n```")
+            elif item_type == "execution_output":
+                part_text.append(str(content.get("content", "")))
+            elif item_type == "image":
+                images = content.get("image", [])
+                if isinstance(images, list):
+                    for image in images:
+                        if isinstance(image, dict) and image.get("image_url"):
+                            part_text.append(f"![image]({image['image_url']})")
+        return part_text, part_reasoning
 
     def _render_full_output(self) -> tuple[str, str]:
         if not self._render_cache_dirty:
@@ -868,33 +915,7 @@ class GLMEventAccumulator:
         self._cached_part_texts.clear()
         self._cached_part_reasonings.clear()
         for logic_id in self.ordered_logic_ids:
-            part = self.parts_by_logic_id.get(logic_id)
-            if not isinstance(part, dict):
-                continue
-            content_items = part.get("content", [])
-            if not isinstance(content_items, list):
-                continue
-
-            part_text: list[str] = []
-            part_reasoning: list[str] = []
-            for content in content_items:
-                if not isinstance(content, dict):
-                    continue
-                item_type = content.get("type")
-                if item_type == "text":
-                    part_text.append(str(content.get("text", "")))
-                elif item_type == "think":
-                    part_reasoning.append(str(content.get("think", "")))
-                elif item_type == "code":
-                    part_text.append(f"```python\n{content.get('code', '')}\n```")
-                elif item_type == "execution_output":
-                    part_text.append(str(content.get("content", "")))
-                elif item_type == "image":
-                    images = content.get("image", [])
-                    if isinstance(images, list):
-                        for image in images:
-                            if isinstance(image, dict) and image.get("image_url"):
-                                part_text.append(f"![image]({image['image_url']})")
+            part_text, part_reasoning = self._content_snapshot(logic_id)
 
             rendered_text = "\n".join(filter(None, part_text)).strip()
             rendered_reasoning = "\n".join(filter(None, part_reasoning)).strip()
