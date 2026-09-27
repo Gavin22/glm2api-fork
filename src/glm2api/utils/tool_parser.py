@@ -402,8 +402,15 @@ def _parse_xml_block(
 
 
 def _mask_code_fences(text: str) -> str:
+    """Blank out fenced code so markup inside it is not scanned as a call."""
+    matches = list(CODE_FENCE_PATTERN.finditer(text))
+    if not matches:
+        # No fence: return the original. Copying every character into a list
+        # and joining it back was the single hottest cost when streaming a
+        # large tool argument.
+        return text
     masked = list(text)
-    for match in CODE_FENCE_PATTERN.finditer(text):
+    for match in matches:
         for index in range(match.start(), match.end()):
             masked[index] = " "
     return "".join(masked)
@@ -583,17 +590,40 @@ def _recover_trailing_block(
     return "", []
 
 
+# A split tag can only ever be this long; scanning the whole buffer to find
+# one made every streamed event proportional to the total output so far.
+MAX_TAG_HINT_LENGTH = max(len(hint) for hint in TAG_NAME_HINTS)
+
+
+# A close tag split across two scans can be at most this long.
+MAX_CLOSE_TAG_LENGTH = max(
+    len("</|dsml|tool_calls>"), len("</|dsmltoolcalls|>"), len("<|/dsmltoolcalls|>")
+) + 8
+
+DSML_TOOL_CALLS_OPEN_PREFIX = "<|dsml|tool_calls"
+
+
+def _is_dsml_open(text: str, index: int | None) -> bool:
+    """True when the held region is an unterminated DSML tool_calls block."""
+    if index is None or index > 0:
+        return False
+    return text[: len(DSML_TOOL_CALLS_OPEN_PREFIX)].lower().startswith(DSML_TOOL_CALLS_OPEN_PREFIX)
+
+
 def _find_partial_tag_start(text: str) -> int | None:
-    lowered_text = text.lower()
-    pipe_tag_start = lowered_text.rfind("<|")
-    if pipe_tag_start != -1 and ">" not in lowered_text[pipe_tag_start:]:
-        return pipe_tag_start
+    if not text:
+        return None
+    window_start = max(0, len(text) - MAX_TAG_HINT_LENGTH)
+    lowered_tail = text[window_start:].lower()
+    pipe_tag_start = lowered_tail.rfind("<|")
+    if pipe_tag_start != -1 and ">" not in lowered_tail[pipe_tag_start:]:
+        return window_start + pipe_tag_start
     for hint in TAG_NAME_HINTS:
         lowered_hint = hint.lower()
-        max_overlap = min(len(hint), len(text))
+        max_overlap = min(len(hint), len(lowered_tail))
         for size in range(max_overlap, 0, -1):
-            if lowered_text.endswith(lowered_hint[:size]):
-                return len(text) - size
+            if lowered_tail.endswith(lowered_hint[:size]):
+                return window_start + len(lowered_tail) - size
     return None
 
 
@@ -622,7 +652,7 @@ def _split_stream_text(
     allowed_tool_names: set[str] | None,
     final: bool,
     required_params: dict[str, list[str]] | None = None,
-) -> tuple[str, str, list[dict[str, object]]]:
+) -> tuple[str, str, list[dict[str, object]], int | None]:
     hold_from_candidates = [
         index
         for index in (_find_unmatched_fence_start(text), _find_incomplete_block_start(text, allow_trailing_close=final))
@@ -634,9 +664,7 @@ def _split_stream_text(
         if partial_start is not None:
             hold_from_candidates.append(partial_start)
 
-    if final:
-        safe_end = min(hold_from_candidates) if hold_from_candidates else len(text)
-    elif hold_from_candidates:
+    if hold_from_candidates:
         safe_end = min(hold_from_candidates)
     else:
         safe_end = len(text)
@@ -647,7 +675,8 @@ def _split_stream_text(
         processable, allowed_tool_names, allow_trailing_close=final, required_params=required_params
     )
     visible = _remove_spans(processable, spans, trim_outer_whitespace=final)
-    return visible, remainder, tool_calls
+    hold_start = safe_end if hold_from_candidates else None
+    return visible, remainder, tool_calls, hold_start
 
 
 def parse_tool_calls_from_text(
@@ -677,23 +706,73 @@ class StreamingToolParser:
     tool_calls: list[dict[str, object]] = field(default_factory=list)
     allowed_tool_names: set[str] | None = None
     required_params: dict[str, list[str]] | None = None
+    _open_block_start: int | None = None
+    _scanned_to: int = 0
+    _close_scan_tail: str = ""
+    _buffer_has_fence: bool = False
+    _buffered_chunks: list[str] = field(default_factory=list)
 
     def consume(self, chunk: str) -> str:
         if not chunk:
             return ""
+        if self._buffered_block_is_open(chunk):
+            return ""
         self.pending_text += chunk
-        visible, remainder, parsed_calls = _split_stream_text(
+        visible, self.pending_text, parsed_calls, hold_start = _split_stream_text(
             self.pending_text,
             allowed_tool_names=self.allowed_tool_names,
             final=False,
             required_params=self.required_params,
         )
-        self.pending_text = remainder
         self.tool_calls.extend(parsed_calls)
+        self._open_block_start = hold_start if _is_dsml_open(self.pending_text, hold_start) else None
+        self._scanned_to = len(self.pending_text)
+        self._close_scan_tail = self.pending_text[-MAX_CLOSE_TAG_LENGTH :]
+        self._buffer_has_fence = "```" in self.pending_text
         return visible
 
+    def _buffered_block_is_open(self, chunk: str) -> bool:
+        """Cheaply accumulate while still inside the last open DSML block.
+
+        Replaying the whole argument on every event kept the per-event cost
+        proportional to everything generated so far, so a large Write spent
+        seconds of parser CPU. The buffer is append-only until the block's
+        close tag appears, and the close-tag search only ever re-reads one
+        short overlap, making each event O(chunk). Anything unusual — a code
+        fence, or a hold that is not a DSML block — falls back to the full
+        scan rather than trying to be clever.
+        """
+        if self._open_block_start is None:
+            return False
+        if "```" in chunk:
+            self._buffer_has_fence = True
+        if self._buffer_has_fence:
+            self._flush_buffered_block()
+            return False
+
+        probe = self._close_scan_tail + chunk
+        if DSML_TOOL_CALLS_CLOSE_PATTERN.search(probe) is not None:
+            # The block ends here: hand the buffer back so the caller's full
+            # scan sees it together with this chunk. The chunk must not also
+            # be buffered, or it would be appended twice.
+            self._flush_buffered_block()
+            return False
+
+        self._buffered_chunks.append(chunk)
+        self._close_scan_tail = probe[-MAX_CLOSE_TAG_LENGTH :]
+        return True
+
+    def _flush_buffered_block(self) -> None:
+        if self._buffered_chunks:
+            self.pending_text += "".join(self._buffered_chunks)
+            self._buffered_chunks = []
+        self._open_block_start = None
+        self._close_scan_tail = ""
+        self._scanned_to = 0
+
     def flush(self) -> tuple[str, list[dict[str, object]]]:
-        visible, remainder, parsed_calls = _split_stream_text(
+        self._flush_buffered_block()
+        visible, remainder, parsed_calls, _ = _split_stream_text(
             self.pending_text,
             allowed_tool_names=self.allowed_tool_names,
             final=True,
